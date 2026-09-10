@@ -1,0 +1,116 @@
+miiotpcApi — 米家笔记本/PC 设备控制 API 与 CLI
+Copyright (C) 2026 comor <304593790@qq.com>
+
+本软件是自由软件：你可以在自由软件基金会发布的 GNU 通用公共许可证
+第 3 版（或你选择的任何更新版本）的条款下重新分发和/或修改它。
+
+本软件的分发是希望它有用，但**不提供任何担保**；甚至没有对适销性
+或特定用途适用性的默示担保。详情请见 GNU 通用公共许可证。
+
+你应该已经随本软件收到一份 GNU 通用公共许可证的副本。如果没有，
+请参阅 <https://www.gnu.org/licenses/>。
+
+完整的许可证全文见本仓库根目录下的 `LICENSE` 文件。
+
+================================================================================
+衍生声明 / DERIVATION NOTICE
+================================================================================
+
+本项目 **不是独立作品**，而是 mijiaAPI 的衍生作品（精简子集）。
+根据 GNU GPL v3 的 copyleft 条款，本项目必须以相同许可证（GPL-3.0-or-later）
+发布。原项目作者保留其原始代码的著作权。
+
+  原项目名称：mijiaAPI
+  原项目作者：Do1e <i@do1e.cn>
+  原项目仓库：https://github.com/Do1e/mijia-api
+  原项目主页：https://mijia-api.do1e.com/
+  原项目许可证：GPL-3.0-or-later
+  本项目所基于的原项目版本：4.2.1
+
+本项目对原项目所做的修改包括但不限于：
+  - 移除 MCP Server 功能（mcp_server.py）
+  - 移除家庭/场景/耗材/统计/小爱音箱等与笔记本控制无关的接口
+  - 新增 PCDevice 高层封装，按 MIoT laptop Spec 提供语义化控制
+  - 精简 CLI，去掉 `pc` 子命令，将 PC 控制选项提升到顶层
+  - 认证文件默认路径改为 ~/.config/miiotpc-api/auth.json
+  - logger 名称改为 miiotpcApi
+
+================================================================================
+上游组件 / UPSTREAM COMPONENTS
+================================================================================
+
+本项目的部分文件继承自更上游的第三方项目。各文件的著作权归其原作者所有，
+并遵循各文件头部声明的许可证。这些 MIT 许可的组件与 GPL-3.0 兼容，
+可被本 GPL 项目聚合分发。
+
+--------------------------------------------------------------------------------
+1. miutils.py — 加密与签名工具
+--------------------------------------------------------------------------------
+   原始来源：micloud
+   原始作者：Sammy Svensson
+   原始邮箱：sammy@ssvensson.se
+   原始仓库：https://github.com/Squachen/micloud/blob/master/micloud/miutils.py
+   许可证：MIT License
+   版权声明：Copyright (c) 2020 Sammy Svensson
+
+   该版权声明与许可证提示已保留在本项目 `src/miiotpcApi/miutils.py` 文件头部。
+   MIT 许可证全文见下文 "MIT License" 一节。
+
+   注意：miutils.py 先被 mijiaAPI 引入（在 GPL-3.0 项目中聚合），
+   本项目又从 mijiaAPI 继承。MIT 许可证允许再分发，只要保留版权声明
+   和许可证文本——本文件与源文件头部均已满足该要求。
+
+--------------------------------------------------------------------------------
+2. errors.py 中的 ERROR_CODE 错误码对照表
+--------------------------------------------------------------------------------
+   参考来源：ha_xiaomi_home（小米 Home Assistant 集成）
+   来源仓库：https://github.com/kekeandzeyu/ha_xiaomi_home
+   来源文件：custom_components/xiaomi_home/miot/i18n/zh-Hans.json
+   说明：错误码数值与中文文案来自该开源项目的国际化资源，属事实性对照数据。
+   该来源已在 `src/miiotpcApi/errors.py` 文件首行以注释形式标注。
+
+--------------------------------------------------------------------------------
+3. MIoT Spec 协议与设备规格数据
+--------------------------------------------------------------------------------
+   规格站点：https://home.miot-spec.com/
+   开发者平台：https://iot.mi.com/
+   说明：设备规格（siid/piid/aiid、属性枚举值等）由小米官方 MIoT Spec 平台
+   提供，属事实性协议数据，不构成本项目的著作权客体。本项目仅在运行时
+   按 model 拉取并解析，不随包分发任何规格数据。
+
+================================================================================
+商标声明 / TRADEMARK NOTICE
+================================================================================
+
+"Xiaomi"、"米家"、"MIoT"、"Mi Home" 等名称与标识是小米科技有限责任公司
+及相关关联方的商标或注册商标。本项目与小米公司**无任何关联、授权、赞助
+或认可关系**，是一个独立的第三方社区项目。
+
+本项目对上述商标的使用仅用于描述软件的互操作目的（表明本软件可与小米
+生态设备通信），不暗示商标持有人对本软件的背书。商标权利归各权利人所有。
+
+================================================================================
+MIT License 全文（适用于 miutils.py）
+================================================================================
+
+MIT License
+
+Copyright (c) 2020 Sammy Svensson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
