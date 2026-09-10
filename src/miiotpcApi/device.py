@@ -11,6 +11,7 @@
 #
 # 完整的衍生声明与上游来源见项目根目录的 NOTICE 文件。
 
+import copy
 import json
 import re
 import time
@@ -34,7 +35,94 @@ from .version import version
 
 
 DEVICE_SPEC_URL = "https://home.miot-spec.com/spec/"
-DEVICE_INFO_CACHE_VERSION = 2
+DEVICE_INFO_CACHE_VERSION = 3
+
+# 米家笔记本/PC 设备共用的内置 MIoT Spec
+#
+# 所有型号含 ".laptop." 的设备（xiaomi.laptop.* / redmi.laptop.*，含 REDMI Book）
+# 共享同一套 siid/piid/aiid，因此无需查询上游站点。
+#
+# 为什么不查 https://home.miot-spec.com：该站点对尚未正式上线、仍在测试阶段的
+# 型号会返回 HTTP 404（例如 xiaomi.laptop.p59），而设备本身是完全可控的。
+# 内置 Spec 消除了这一网络依赖，也省去每次请求。
+#
+# 来源：xiaomi.laptop.p52 的官方规格，与同代机型一致。
+LAPTOP_MODEL_MARKER = ".laptop."
+
+LAPTOP_SPEC_PROPERTIES = [
+    {
+        "name": "status",
+        "description": "Status / 工作状态",
+        "type": "uint",
+        "rw": "r",
+        "range": None,
+        "value-list": [
+            {"value": 1, "description": "Waking Up", "desc_zh_cn": "正在唤醒"},
+            {"value": 2, "description": "Power Off", "desc_zh_cn": "已关机"},
+            {"value": 3, "description": "Sleep", "desc_zh_cn": "已睡眠"},
+            {"value": 4, "description": "Shutting Down", "desc_zh_cn": "正在关机"},
+            {"value": 6, "description": "Going Sleep", "desc_zh_cn": "正在进入睡眠"},
+            {"value": 8, "description": "Running", "desc_zh_cn": "运行中"},
+        ],
+        "method": {"siid": 2, "piid": 1},
+    },
+    {
+        "name": "temperature",
+        "description": "Temperature / 温度",
+        "type": "float",
+        "rw": "r",
+        "range": [0, 130, 1],
+        "value-list": None,
+        "method": {"siid": 3, "piid": 1},
+    },
+    {
+        "name": "battery-level",
+        "description": "Battery Level / 电池电量",
+        "type": "uint",
+        "rw": "r",
+        "range": [0, 100, 1],
+        "value-list": None,
+        "method": {"siid": 4, "piid": 1},
+    },
+    {
+        "name": "charging-state",
+        "description": "Charging State / 电池充电状态",
+        "type": "uint",
+        "rw": "r",
+        "range": None,
+        "value-list": [
+            {"value": 1, "description": "AC Power", "desc_zh_cn": "插电状态"},
+            {"value": 2, "description": "Battery Power", "desc_zh_cn": "离电状态"},
+        ],
+        "method": {"siid": 4, "piid": 2},
+    },
+]
+
+LAPTOP_SPEC_ACTIONS = [
+    {
+        "name": "turn-on",
+        "description": "Turn On / 唤醒/开机",
+        "method": {"siid": 2, "aiid": 1},
+    },
+    {
+        "name": "turn-off",
+        "description": "Turn Off / 关机",
+        "method": {"siid": 2, "aiid": 2},
+    },
+    {
+        "name": "sleep-mode-on",
+        "description": "Sleep Mode On / 睡眠",
+        "method": {"siid": 2, "aiid": 3},
+    },
+]
+
+
+def _is_laptop_model(model: Optional[str]) -> bool:
+    """判断型号是否属于共用内置 Spec 的笔记本/PC 设备。
+
+    匹配 model 中是否含 ".laptop."，覆盖 xiaomi.laptop.* 与 redmi.laptop.*。
+    """
+    return LAPTOP_MODEL_MARKER in (model or "").lower()
 
 
 def _type_name(type_urn: str) -> str:
@@ -518,7 +606,21 @@ def get_device_info(device_model: str, cache_path: Optional[Union[str, Path]] = 
 
     返回值:
         dict: 设备规格信息
+
+    说明:
+        型号含 ".laptop." 的笔记本设备直接返回内置 Spec，不访问网络也不读缓存。
+        其他型号仍从 home.miot-spec.com 获取并缓存。
     """
+    if _is_laptop_model(device_model):
+        logger.debug(f"使用内置笔记本 Spec: {device_model}")
+        return {
+            "version": DEVICE_INFO_CACHE_VERSION,
+            "name": device_model,
+            "model": device_model,
+            "properties": copy.deepcopy(LAPTOP_SPEC_PROPERTIES),
+            "actions": copy.deepcopy(LAPTOP_SPEC_ACTIONS),
+        }
+
     cache_file = None
     if cache_path is not None:
         cache_file = Path(cache_path) / f"{device_model}.json"

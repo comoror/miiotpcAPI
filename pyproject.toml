@@ -1,6 +1,6 @@
 [project]
 name = "miiotpcApi"
-version = "0.1.0"
+version = "0.1.1"
 description = "米家笔记本/PC 设备控制 API 与 CLI（mijiaAPI 的精简子集）"
 readme = "README.md"
 requires-python = ">=3.10"
