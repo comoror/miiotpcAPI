@@ -54,6 +54,8 @@ class miiotpcAPI():
 
         self._available_cache = None
         self._available_cache_time = 0
+        self._devices_list_cache = None
+        self._devices_list_cache_time = 0
 
         if self.auth_data_path.exists():
             with open(self.auth_data_path, "r") as f:
@@ -303,14 +305,26 @@ class miiotpcAPI():
         data = {"begin_at": begin_at}
         return self._request(uri, data, refresh_token=refresh_token)
 
-    def get_devices_list(self) -> list:
+    def get_devices_list(self, use_cache: bool = True) -> list:
         """
         获取所有设备列表（含共享设备）
+
+        参数:
+            use_cache: 是否使用短 TTL 缓存。批量操作会反复构造设备对象，
+                       每次都拉一遍列表既慢又无必要；默认缓存 30 秒。
 
         返回值:
             list: 设备信息列表，每个元素包含 did, name, model, isOnline 等字段
         """
-        return self._get_all_devices()
+        if use_cache and self._devices_list_cache is not None:
+            if time.time() - self._devices_list_cache_time < 30:
+                logger.debug("使用缓存的设备列表")
+                return self._devices_list_cache
+
+        devices = self._get_all_devices()
+        self._devices_list_cache = devices
+        self._devices_list_cache_time = time.time()
+        return devices
 
     def _get_all_devices(self) -> list:
         """通过共享设备接口获取所有设备"""

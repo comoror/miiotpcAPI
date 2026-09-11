@@ -251,6 +251,10 @@ class MiotDevice():
                 dev_name = matches[0].get("name", None)
                 model = matches[0]["model"]
 
+        # 米家上报的在线状态。设备离线（关机/睡眠后断网）时，云端仍会返回
+        # 最后一次上报的属性值，那些数值已过期，不能当作实时数据。
+        self.is_online = bool(matches[0].get("isOnline"))
+
         dev_info = get_device_info(model, cache_path=api.auth_data_path.parent)
         self.did = did
         self.model = model
@@ -462,14 +466,32 @@ class PCDevice():
         return self._capabilities.copy()
 
     @property
+    def is_online(self) -> bool:
+        """设备是否在线（米家上报）。离线时 status 中的数值是过期快照。"""
+        return bool(getattr(self._device, "is_online", True))
+
+    @property
     def status(self) -> dict:
-        """获取设备状态概览"""
+        """获取设备状态概览
+
+        返回值中 `isOnline` 表示米家上报的在线状态。设备离线时云端仍会返回
+        最后一次上报的属性值，此时 `data_is_live` 为 False，并附带 `warning`
+        说明数值已过期——调用方不应把这些值当作实时数据呈现。
+        """
+        is_online = bool(getattr(self._device, "is_online", True))
         result = {
             "name": self.name,
             "model": self.model,
             "did": self.did,
+            "isOnline": is_online,
+            "data_is_live": is_online,
             "capabilities": self.capabilities,
         }
+        if not is_online:
+            result["warning"] = (
+                "设备离线，以下属性值是云端缓存的最后一次上报数据，不是实时值，"
+                "可能与设备当前实际状态不符。"
+            )
         for semantic_name, prop in self._prop_map.items():
             if "r" in prop.rw:
                 try:

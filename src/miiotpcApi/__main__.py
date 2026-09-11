@@ -70,7 +70,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     pc_actions.add_argument("--temperature", action="store_true", help="获取 CPU 温度")
     pc_actions.add_argument("--battery", action="store_true", help="获取电池电量")
     pc_actions.add_argument("--charging-state", action="store_true", help="获取充电状态")
-    pc_actions.add_argument("--status", action="store_true", help="获取状态概览")
+    pc_actions.add_argument(
+        "--status",
+        action="store_true",
+        help="获取状态概览；不指定 --did/--dev-name 时批量查询所有笔记本",
+    )
+    pc_actions.add_argument(
+        "--get-prop",
+        metavar="PROP",
+        help="按属性名读取（笔记本: status/temperature/battery-level/charging-state）",
+    )
+    pc_actions.add_argument("--list-properties", action="store_true", help="列出设备支持的属性")
+    pc_actions.add_argument("--list-actions", action="store_true", help="列出设备支持的动作")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -148,12 +159,51 @@ def handle_action(api: miiotpcAPI, args: argparse.Namespace) -> None:
 
 
 def handle_pc(api: miiotpcAPI, args: argparse.Namespace) -> None:
+    # --status 不指定设备时，批量查询所有笔记本。
+    # 这样智能体一次调用就能拿到全部设备的 isOnline / data_is_live，
+    # 不必先 list 再逐台查询（N+1 次调用）。
+    if args.status and not args.did and not args.dev_name:
+        devices = api.find_pc_devices()
+        if not devices:
+            print("未找到 PC/笔记本设备。")
+            return
+        results = []
+        for entry in devices:
+            try:
+                pc = PCDevice(api, did=entry["did"], sleep_time=0)
+                results.append(pc.status)
+            except Exception as exc:
+                results.append({
+                    "name": entry.get("name"),
+                    "model": entry.get("model"),
+                    "did": entry.get("did"),
+                    "isOnline": bool(entry.get("isOnline")),
+                    "data_is_live": False,
+                    "error": str(exc),
+                })
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+        return
+
     if not args.did and not args.dev_name:
-        raise RuntimeError("必须指定 --did 或 --dev-name；列出设备请使用 'miiotpcApi --list-pc'")
+        raise RuntimeError("必须指定 --did 或 --dev-name；批量查看状态请用 '--status'（不带设备参数）")
 
     pc = PCDevice(api, did=args.did, dev_name=args.dev_name)
     if args.status:
         print(json.dumps(pc.status, indent=2, ensure_ascii=False))
+    elif args.list_properties:
+        for name, prop in pc._device.prop_list.items():
+            if "_" in name:
+                continue  # 跳过下划线别名
+            rw = {"r": "只读", "rw": "读写", "w": "只写"}.get(prop.rw, prop.rw)
+            m = prop.method
+            print(f"{name:<20} siid={m.get('siid', '?'):<3} piid={m.get('piid', '?'):<3} {rw:<4} {prop.desc}")
+    elif args.list_actions:
+        for name, act in pc._device.action_list.items():
+            m = act.method
+            print(f"{name:<20} siid={m.get('siid', '?'):<3} aiid={m.get('aiid', '?'):<3} {act.desc}")
+    elif args.get_prop:
+        value = pc.get_prop(args.get_prop)
+        print(f"{pc.name} 的 {args.get_prop} = {value}")
     elif args.power == "on":
         pc.power_on()
         print(f"{pc.name} 已开机")
@@ -195,6 +245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             getattr(args, name, None) not in (None, False)
             for name in (
                 "power", "temperature", "battery", "charging_state", "status",
+                "get_prop", "list_properties", "list_actions",
             )
         )
         if not args.command and not args.list_devices and not args.list_pc and not has_pc_action:
