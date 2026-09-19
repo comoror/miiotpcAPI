@@ -2,320 +2,147 @@
 
 ## 测试框架
 
-使用 Python 内置 `unittest`，不引入额外测试依赖。
+使用 **pytest**，作为可选开发依赖声明在 `pyproject.toml` 中：
+
+```toml
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+```
+
+> 早期草稿曾写「使用 Python 内置 unittest，不引入额外测试依赖」，但代码示例与
+> 实际实现均为 pytest。本文档已更正为与实现一致。
+
+## 运行测试
+
+```bash
+# 全部测试
+uv run --extra dev pytest tests/ -v
+
+# 单个文件
+uv run --extra dev pytest tests/test_cli.py -v
+
+# 指定测试类
+uv run --extra dev pytest tests/test_device.py::TestStatusSemantics -v
+
+# 指定用例
+uv run --extra dev pytest tests/test_cli.py::TestForceUtf8Stdio -v
+
+# 只跑回归防护（status 判读语义）
+uv run --extra dev pytest tests/ -k "StatusSemantics or Consistency" -v
+```
+
+pytest 是可选依赖，声明在 `dev` extra 中。**全新环境（刚 clone、venv 未装 dev 依赖）
+下必须带 `--extra dev`**，否则报 `Failed to spawn: pytest`。
+
+注意：一旦用 `--extra dev` 跑过一次，pytest 会留在 venv 里，之后裸 `uv run pytest`
+也能用。所以「不带 `--extra dev` 就会失败」只在全新环境下成立，
+换机器或重建 venv 时仍需加上。
 
 ## 测试结构
 
 ```
 tests/
-├── test_api.py       # API 客户端测试
-├── test_device.py    # 设备封装测试
-└── test_cli.py       # CLI 参数解析测试
+├── test_api.py      # find_pc_devices 关键词筛选逻辑
+├── test_device.py   # PCDevice.status 语义（核心回归防护）
+└── test_cli.py      # 参数解析、设备列表输出、UTF-8 重配置、一致性守护
 ```
 
-## 测试用例设计
+所有用例**不联网**：`miiotpcAPI` 与 `PCDevice` 均通过 `object.__new__` 构造，
+注入桩对象替代真实设备与网络请求。
 
-### test_api.py
+## 各文件覆盖范围
 
-```python
-"""API 客户端测试 - Mock 网络请求"""
+### test_device.py — status 判读语义
 
-import json
-import pytest
-from unittest.mock import patch, MagicMock
-from pathlib import Path
+这是全项目最关键的一组回归防护，锁定了 v0.1.3 确认的三维判读规则：
 
-# --- 测试初始化 ---
+| 字段 | 含义 | 关机时 |
+|------|------|--------|
+| `status` | **OS 运行状态**，8=运行中，**非 8 即非运行中** | `2`（唯一开关机判据） |
+| `isOnline` | 米家上报的联网状态 | `true`（EC 待机供电，联网模块仍在） |
+| `data_is_live` | 属性值是否实时 | `true`（EC 仍在上报） |
 
-class TestAPIInit:
-    def test_default_auth_path(self):
-        """默认认证路径为 ~/.config/miiotpc-api/auth.json"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI()
-        expected = Path.home() / ".config" / "miiotpc-api" / "auth.json"
-        assert api.auth_data_path == expected
+关键用例 `test_powered_off_but_online_still_reports_live_values` 锁定一条容易被
+"修好"的事实：**OS 关机 ≠ 数值过期**。温度与电量由主板 EC 上报，EC 始终有
+待机供电并持续采样，所以 `isOnline=True` + `status=2` 时 `data_is_live` 依然为
+`True`，且不应出现 `warning`。只有设备真正离线（断网/拔电）时 `data_is_live`
+才为 `False`。
 
-    def test_custom_auth_path(self):
-        """自定义认证路径"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/test-auth.json")
-        assert api.auth_data_path == Path("/tmp/test-auth.json")
+同时覆盖：
 
-    def test_auth_path_as_directory(self):
-        """传入目录时自动添加 auth.json"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/test-dir")
-        assert api.auth_data_path == Path("/tmp/test-dir/auth.json")
+- `status` 字段对 MIoT 枚举 1/2/3/4/6/8 的透传
+- `pc.is_on()` 的判据是 `status == 8`
+- 返回的 `capabilities` 是副本，外部改动不污染内部状态
+- 单个属性读取失败时内联为 `<读取失败: ...>` 字符串，不中断整体查询
+- 取值走 MIoT 原始属性名（`battery-level`）而非语义名（`battery_level`）
+- docstring 必须写全枚举、包含「非 8 即非运行中」和 EC 机制说明
 
-    def test_missing_auth_file(self):
-        """认证文件不存在时 auth_data 为空字典"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-        assert api.auth_data == {}
+### test_cli.py — 参数解析与输出
 
+参数解析：
 
-# --- 测试认证状态 ---
+- `--list-pc` / `-l` / `--status`（含批量形态：不带 `--did`/`--dev-name` 合法）
+- `--power on/sleep/off`；非法取值（如 `toggle`）必须 `SystemExit`
+  —— 电源操作**没有 toggle**
+- `--did` 与 `--dev-name` 互斥
+- 顶层动作互斥：`--status` 不能与 `--temperature`/`--battery`/`--charging-state` 并用
+- 子命令 `login`/`get`/`set`/`action` 的 `args.command`；`get` 必须带 `--prop-name`
+- `-v/--version` 打印版本号并以 0 退出
 
-class TestAPIAuth:
-    def test_available_no_data(self):
-        """无认证数据时 available 为 False"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-        assert api.available == False
+`print_devices()`：
 
-    def test_available_missing_keys(self):
-        """认证数据缺少必要字段时 available 为 False"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI()
-        api.auth_data = {"ua": "test"}  # 缺少 ssecurity, userId 等
-        assert api.available == False
+- 字段标签必须是**「联网状态」**，不是易被误读为开关机的「状态」
+- 提供 `note` 时打印「提示: ...」，未提供则不打印
+- **列表为空时提前 return，`note` 不打印**（当前行为，测试锁定现状）
+- 缺失字段渲染为占位符 `<未命名设备>` / `<未知>`
 
+`force_utf8_stdio()`：
 
-# --- 测试 PC 设备筛选 ---
+- 同时切换 stdout 与 stderr
+- 幂等：重复调用无副作用
+- 流没有 `reconfigure`（测试捕获、重定向）时静默跳过
+- `reconfigure` 抛 `ValueError`/`OSError` 时被捕获，不影响 CLI 运行
+- **`main()` 入口必须调用它** —— 程序化入口（测试、第三方集成直接调
+  `main(argv)`）同样需要编码修复
 
-class TestFindPCDevices:
-    @patch('miiotpcApi.api.requests.Session')
-    def test_find_pc_devices_by_name(self, mock_session):
-        """通过设备名称筛选PC设备"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-        api.get_devices_list = MagicMock(return_value=[
-            {"did": "1", "name": "我的笔记本", "model": "xiaomi.pc.v1", "isOnline": True},
-            {"did": "2", "name": "客厅灯", "model": "yeelink.light.lamp4", "isOnline": True},
-            {"did": "3", "name": "工作电脑", "model": "generic.desktop", "isOnline": False},
-        ])
+一致性守护：
 
-        result = api.find_pc_devices()
-        assert len(result) == 2
-        assert result[0]["did"] == "1"
-        assert result[1]["did"] == "3"
+- `version.py` 与 `pyproject.toml` 的版本号必须一致（不一致会导致发版错位）
+- `status` 枚举在 `PCDevice.status` docstring 与 CLI `note` 提示语之间必须一致，
+  且都是完整的 `{1,2,3,4,6,8}`
 
-    @patch('miiotpcApi.api.requests.Session')
-    def test_find_pc_devices_with_keyword(self, mock_session):
-        """通过自定义关键词筛选"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-        api.get_devices_list = MagicMock(return_value=[
-            {"did": "1", "name": "小米笔记本Pro", "model": "xiaomi.notebook.v1", "isOnline": True},
-            {"did": "2", "name": "客厅灯", "model": "yeelink.light.lamp4", "isOnline": True},
-        ])
+> 该守护用例曾暴露真实缺陷：CLI 提示语写成 `（1 唤醒中 / 2 已关机 ...）`，
+> 而 docstring 写成 `1=正在唤醒`，信息相同但记法不一致。现已统一为 `N=label`。
 
-        result = api.find_pc_devices(keyword="小米")
-        assert len(result) == 1
-        assert result[0]["name"] == "小米笔记本Pro"
+### test_api.py — 设备筛选逻辑
 
+`find_pc_devices()` 是 `--list-pc` 能否找到设备的**唯一**依据，覆盖：
 
-# --- 测试设备属性读写（Mock）---
-
-class TestDevicePropAPI:
-    def test_get_devices_prop_single(self):
-        """单个属性查询"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-        api._request = MagicMock(return_value=[
-            {"did": "123", "siid": 2, "piid": 1, "value": True, "code": 0}
-        ])
-
-        result = api.get_devices_prop({"did": "123", "siid": 2, "piid": 1})
-        assert result["value"] == True
-
-    def test_set_devices_prop_code_1(self):
-        """设置属性返回 code=1（网关已接收）"""
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-        api._request = MagicMock(return_value=[
-            {"did": "123", "siid": 2, "piid": 1, "code": 1}
-        ])
-
-        result = api.set_devices_prop({"did": "123", "siid": 2, "piid": 1, "value": True})
-        assert result["message"] == "成功"
-```
-
-### test_device.py
-
-```python
-"""设备封装测试"""
-
-import pytest
-from unittest.mock import MagicMock, patch
-
-# --- DevProp 测试 ---
-
-class TestDevProp:
-    def test_valid_prop(self):
-        """合法属性初始化"""
-        from miiotpcApi.device import DevProp
-        prop = DevProp({
-            "name": "on",
-            "description": "开关",
-            "type": "bool",
-            "rw": "rw",
-            "range": None,
-            "value-list": None,
-            "method": {"siid": 2, "piid": 1}
-        })
-        assert prop.name == "on"
-        assert prop.type == "bool"
-        assert prop.rw == "rw"
-        assert prop.method == {"siid": 2, "piid": 1}
-
-    def test_invalid_type(self):
-        """不支持的类型应抛出 ValueError"""
-        from miiotpcApi.device import DevProp
-        with pytest.raises(ValueError, match="不支持的类型"):
-            DevProp({
-                "name": "test",
-                "description": "测试",
-                "type": "object",
-                "rw": "r",
-                "range": None,
-                "method": {"siid": 1, "piid": 1}
-            })
-
-
-# --- MiotDevice 测试 ---
-
-class TestMiotDevice:
-    def test_init_requires_did_or_name(self):
-        """必须提供 did 或 dev_name"""
-        from miiotpcApi.device import MiotDevice
-        from miiotpcApi import miiotpcAPI
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-
-        with pytest.raises(ValueError, match="必须提供"):
-            MiotDevice(api)
-
-    def test_device_not_found(self):
-        """设备未找到应抛出异常"""
-        from miiotpcApi.device import MiotDevice
-        from miiotpcApi import miiotpcAPI
-        from miiotpcApi.errors import DeviceNotFoundError
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-        api.get_devices_list = MagicMock(return_value=[])
-
-        with pytest.raises(DeviceNotFoundError):
-            MiotDevice(api, dev_name="不存在的设备")
-
-    def test_multiple_devices_found(self):
-        """多个同名设备应抛出异常"""
-        from miiotpcApi.device import MiotDevice
-        from miiotpcApi import miiotpcAPI
-        from miiotpcApi.errors import MultipleDevicesFoundError
-        api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-        api.get_devices_list = MagicMock(return_value=[
-            {"did": "1", "name": "笔记本", "model": "a.b.c"},
-            {"did": "2", "name": "笔记本", "model": "d.e.f"},
-        ])
-
-        with pytest.raises(MultipleDevicesFoundError):
-            MiotDevice(api, dev_name="笔记本")
-
-
-# --- PCDevice 测试 ---
-
-class TestPCDevice:
-    def test_check_capability_not_supported(self):
-        """不支持的操作应抛出 NotImplementedError"""
-        from miiotpcApi.device import PCDevice, MiotDevice
-        from unittest.mock import patch
-
-        # Mock MiotDevice 和 get_device_info
-        with patch('miiotpcApi.device.MiotDevice') as MockDevice:
-            mock_instance = MockDevice.return_value
-            mock_instance.prop_list = {}
-            mock_instance.action_list = {}
-
-            from miiotpcApi import miiotpcAPI
-            api = miiotpcAPI(auth_data_path="/tmp/nonexistent/auth.json")
-
-            pc = PCDevice(api, dev_name="test")
-            with pytest.raises(NotImplementedError, match="不支持"):
-                pc.power_on()
-```
-
-### test_cli.py
-
-```python
-"""CLI 参数解析测试"""
-
-import pytest
-from miiotpcApi.__main__ import parse_args
-
-class TestCLIArgs:
-    def test_login_subcommand(self):
-        """login 子命令解析"""
-        args = parse_args(['login'])
-        assert args.func == 'login'
-
-    def test_get_subcommand(self):
-        """get 子命令解析"""
-        args = parse_args(['get', '--dev_name', '笔记本', '--prop_name', 'on'])
-        assert args.func == 'get'
-        assert args.dev_name == '笔记本'
-        assert args.prop_name == 'on'
-
-    def test_set_subcommand(self):
-        """set 子命令解析"""
-        args = parse_args(['set', '--dev_name', '笔记本', '--prop_name', 'brightness', '--value', '80'])
-        assert args.func == 'set'
-        assert args.value == '80'
-
-    def test_pc_list(self):
-        """pc --list 解析"""
-        args = parse_args(['pc', '--list'])
-        assert args.func == 'pc'
-        assert args.list == True
-
-    def test_pc_power_on(self):
-        """pc --power on 解析"""
-        args = parse_args(['pc', '--dev_name', '笔记本', '--power', 'on'])
-        assert args.func == 'pc'
-        assert args.power == 'on'
-        assert args.dev_name == '笔记本'
-
-    def test_pc_sleep(self):
-        """pc --sleep 解析"""
-        args = parse_args(['pc', '--did', '12345', '--sleep'])
-        assert args.func == 'pc'
-        assert args.sleep == True
-        assert args.did == '12345'
-
-    def test_list_devices(self):
-        """-l 选项解析"""
-        args = parse_args(['-l'])
-        assert args.list_devices == True
-
-    def test_list_pc(self):
-        """--list_pc 选项解析"""
-        args = parse_args(['--list_pc'])
-        assert args.list_pc == True
-
-    def test_get_device_info(self):
-        """--get_device_info 选项解析"""
-        args = parse_args(['--get_device_info', 'xiaomi.pc.v1'])
-        assert args.get_device_info == 'xiaomi.pc.v1'
-```
-
-## 运行测试
-
-```bash
-# 运行所有测试
-uv run pytest tests/ -v
-
-# 运行单个测试文件
-uv run pytest tests/test_api.py -v
-
-# 运行指定测试类
-uv run pytest tests/test_device.py::TestMiotDevice -v
-
-# 运行指定测试方法
-uv run pytest tests/test_cli.py::TestCLIArgs::test_pc_power_on -v
-```
+- 默认关键词 `pc`/`电脑`/`笔记本`/`laptop`/`desktop`/`notebook` 每一个都生效
+- 匹配大小写不敏感（`MY LAPTOP` 能命中）
+- 名称与 model 任一命中即可
+- **无关键词命中时返回空列表** —— skill 文档记载的已知坑：
+  设备名不含 PC 关键词时 `--list-pc` 为空，应改用 `--list-devices`
+- 自定义 `keyword` 是**追加**到默认集合，不覆盖
+- 自定义关键词自动转小写
+- `name`/`model` 字段缺失时不抛异常
+- 返回的是原始设备字典，字段不被改写
 
 ## 测试原则
 
-1. **Mock 网络请求**：所有对外部 API 的调用都通过 `unittest.mock` 模拟，不发送真实请求
-2. **测试异常路径**：覆盖所有可能的错误场景（设备未找到、属性不可写、认证失败等）
-3. **CLI 参数解析**：单独测试 argparse 的参数解析逻辑
-4. **不测试加密逻辑**：`miutils.py` 直接从 mijiaAPI 复制，不额外测试
-5. **不测试认证流程**：`login()` 需要真实扫码，仅测试初始化和状态检查
+1. **不联网**：所有对外部 API 的调用用桩对象替代，不发送真实请求
+2. **不测试加密逻辑**：`miutils.py` 直接复用自 mijiaAPI，不重复测试
+3. **不测试认证流程**：`login()` 需要真实扫码，属人工流程，禁止在测试中触发
+4. **锁定语义而非实现细节**：`data_is_live` 这类语义一旦变更必须是显式决策，
+   测试的作用是让这种变更无法悄悄发生
+5. **守护文档与代码的一致性**：枚举值、版本号这类分散在多处的信息，
+   用测试强制对齐
+
+## 已知局限
+
+- **`tests/` 不覆盖真实设备交互**：桩对象无法发现米家云端行为变化
+  （例如某个 model 的 Spec 变更）。这类问题只能靠实机调用发现。
+- **PowerShell 形态的 CLI 调用未纳入测试**：pytest 只跑 Python 进程内逻辑，
+  文档中的 PowerShell 管道示例需人工验证。
+- **`get`/`set`/`action` 的网络错误路径未覆盖**：这些路径需要 mock
+  `requests` 会话，当前测试集未包含。
