@@ -251,8 +251,13 @@ class MiotDevice():
                 dev_name = matches[0].get("name", None)
                 model = matches[0]["model"]
 
-        # 米家上报的在线状态。设备离线（关机/睡眠后断网）时，云端仍会返回
-        # 最后一次上报的属性值，那些数值已过期，不能当作实时数据。
+        # 米家上报的联网状态。**不要把它当作开关机判据**：关机/睡眠时主板 EC
+        # 仍有待机供电、联网模块保持在线，所以 is_online 仍可能是 True。
+        # 判断 OS 是否运行看 PCDevice.status 里的 status 字段（8=运行中）。
+        #
+        # 属性值是否过期同样不取决于关机/睡眠——温度与电量由 EC 上报，OS 停止后
+        # EC 仍在工作，数值依然实时。只有设备真正离线（断网/拔电）时，云端返回的
+        # 才是最后一次上报的过期快照。
         self.is_online = bool(matches[0].get("isOnline"))
 
         dev_info = get_device_info(model, cache_path=api.auth_data_path.parent)
@@ -474,9 +479,19 @@ class PCDevice():
     def status(self) -> dict:
         """获取设备状态概览
 
-        返回值中 `isOnline` 表示米家上报的在线状态。设备离线时云端仍会返回
-        最后一次上报的属性值，此时 `data_is_live` 为 False，并附带 `warning`
-        说明数值已过期——调用方不应把这些值当作实时数据呈现。
+        三个字段回答三个不同的问题，不可互相替代：
+
+        - ``status``：操作系统运行状态。**判断设备是否开机只看它**——
+          8=运行中（Running）；**非 8 即非运行中**，其余取值为
+          1=正在唤醒、2=已关机、3=已睡眠、4=正在关机、6=正在进入睡眠。
+        - ``isOnline``：米家上报的联网状态。关机时主板 EC 仍有待机供电、
+          联网模块保持在线，因此 ``isOnline`` 为 True 并不代表 OS 在运行。
+        - ``data_is_live``：属性值是否为实时上报。温度与电量由主板 EC 上报，
+          OS 关机后 EC 仍在工作，所以**关机设备的这两个值依然是实时的**；
+          只有设备真正离线（``isOnline`` 为 False）时才退化为过期快照。
+
+        仅当 ``data_is_live`` 为 False 时附带 ``warning``，说明数值已过期——
+        调用方不应把这些值当作实时数据呈现。
         """
         is_online = bool(getattr(self._device, "is_online", True))
         result = {

@@ -127,7 +127,7 @@ def init_api(auth_path: Path) -> miiotpcAPI:
     return api
 
 
-def print_devices(devices: list[dict], heading: str) -> None:
+def print_devices(devices: list[dict], heading: str, note: str | None = None) -> None:
     if not devices:
         print(f"未找到{heading}。")
         return
@@ -137,7 +137,11 @@ def print_devices(devices: list[dict], heading: str) -> None:
         print(f"  - {device.get('name', '<未命名设备>')}")
         print(f"    did: {device.get('did', '<未知>')}")
         print(f"    model: {device.get('model', '<未知>')}")
-        print(f"    状态: {online}")
+        # 「联网状态」而非「状态」：关机设备的 EC 待机供电仍保持联网，
+        # 显示「在线」极易被误读为「已开机」。
+        print(f"    联网状态: {online}")
+    if note:
+        print(f"提示: {note}")
 
 
 def handle_get(api: miiotpcAPI, args: argparse.Namespace) -> None:
@@ -225,7 +229,30 @@ def handle_pc(api: miiotpcAPI, args: argparse.Namespace) -> None:
         raise RuntimeError("请指定操作，例如 --status 或 --power on/sleep/off")
 
 
+def force_utf8_stdio() -> None:
+    """将标准输出/错误流切换为 UTF-8。
+
+    Python 在 Windows 上默认按本地代码页（常为 GBK / cp936）写 stdout，
+    中文提示会被下游按 UTF-8 解读成乱码，调用方（尤其是智能体）无法从
+    输出本身判断错误原因。本项目不依赖控制台代码页，统一切到 UTF-8 更安全。
+
+    流可能已被重定向或被测试框架替换，此时没有 ``reconfigure``，需容错跳过。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            # 流不支持运行时重配置，保持原编码
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    # 放在 main() 而非 cli()：main() 是程序化入口（测试、第三方集成会直接调用），
+    # 编码问题对这些调用方同样成立。该函数幂等且对不支持的流静默跳过，可安全重复调用。
+    force_utf8_stdio()
     args = parse_args(argv)
 
     try:
@@ -256,7 +283,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.list_devices:
             print_devices(api.get_devices_list(), "设备列表")
         if args.list_pc:
-            print_devices(api.find_pc_devices(), "PC/笔记本设备")
+            print_devices(
+                api.find_pc_devices(),
+                "PC/笔记本设备",
+                note=(
+                    "联网状态不代表是否开机——关机时主板 EC 待机供电仍保持在线。"
+                    "判断开机请用 --status：8=运行中，非 8 即非运行中"
+                    "（1 唤醒中 / 2 已关机 / 3 已睡眠 / 4 关机中 / 6 进入睡眠中）。"
+                ),
+            )
 
         if args.command == "get":
             handle_get(api, args)
@@ -276,7 +311,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def cli() -> None:
-    """Console-script entry point."""
+    """Console-script entry point.
+
+    UTF-8 流重配置由 ``main()`` 负责，此处无需重复调用。
+    """
     raise SystemExit(main())
 
 
