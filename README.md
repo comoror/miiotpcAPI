@@ -3,8 +3,12 @@
 米家笔记本/PC 设备控制 API 与 CLI。
 
 本项目是 [mijiaAPI](https://github.com/Do1e/mijia-api) 的**精简子集**，只保留控制
-笔记本/PC 设备所需的能力，去掉了 MCP Server、家庭、场景、耗材、统计、小爱音箱
-等与笔记本控制无关的部分。
+笔记本/PC 设备所需的能力，去掉了家庭、场景、耗材、统计、小爱音箱等与笔记本
+控制无关的部分。
+
+0.2.0 起新增了一个**为 AI agent 定制的 MCP server**（`miiotpcApi-mcp`）。它不是
+上游那份通用 MCP Server 的照搬，而是只针对笔记本查询/控制、且返回**已解读结果**
+的精简实现，依赖是可选的，不装不影响 CLI 与 Python API。
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -23,7 +27,8 @@
 - 查询工作状态、CPU 温度、电池电量、充电状态
 - 通用 MIoT 属性读写与动作执行
 - 查看任意设备型号的 MIoT Spec（无需登录）
-- 提供 Python API 与 CLI 两种使用方式
+- 提供 **Python API、CLI、MCP server** 三种使用方式
+- MCP server 返回**已解读的中文结果**，AI agent 无需自己翻译 MIoT 枚举
 
 ## 安装
 
@@ -80,13 +85,60 @@ print(pc.get_battery_level())# 电池电量
 print(pc.status)             # 状态概览
 ```
 
+### MCP server（供 AI agent 调用）
+
+MCP 依赖是**可选**的，需要额外安装：
+
+```bash
+pip install "miiotpcApi[mcp]"
+```
+
+注册到 Claude Code：
+
+```bash
+claude mcp add --transport stdio miiotpc \
+  -- uvx --from "miiotpcApi[mcp]@latest" miiotpcApi-mcp
+```
+
+> **必须带 `@latest` 或固定版本号，不要写裸 `miiotpcApi[mcp]`。**
+> 实测裸 spec 会被 uv 解析到 **0.1.0**，而旧版本没有 `miiotpcApi-mcp` 入口，
+> server 根本起不来。以下写法均正确解析到 0.2.0：
+> `"miiotpcApi[mcp]@latest"`、`"miiotpcApi[mcp]==0.2.0"`、`"miiotpcApi[mcp]>=0.2.0"`。
+> 想锁定版本就用 `==0.2.0`；想跟随更新就用 `@latest`。
+
+暴露 5 个工具：
+
+| 工具 | 用途 |
+|------|------|
+| `list_devices` | 列出笔记本设备（did / 名称 / 型号 / 联网状态）|
+| `get_power_status` | 查询是否开机；不传 `did` 则批量查全部 |
+| `get_full_status` | 完整状态：运行状态 + 温度 + 电量 + 充电 |
+| `set_power` | 唤醒开机 / 睡眠 / 关机 |
+| `get_device_spec` | 查 MIoT Spec（**免认证**）|
+
+**所有工具返回已解读的中文文本**，而不是原始枚举值。例如不会只给
+`status: 3`，而是给「已睡眠（status=3，非运行中）」，并说明关机/睡眠设备的
+温度与电量由主板 EC 上报、依然是实时值。
+
+> **为什么这样做**：MIoT 的 `status` 是枚举、`isOnline` 是联网状态，二者正交
+> 且都容易被误读。如果工具只返回裸数据，调用方几乎必然把「关机设备的温度」
+> 当成过期快照丢掉——而实际上关机后主板 EC 仍在工作，那些数值是实时的。
+> 把解读写进返回值，领域规则就落在了可测试的代码里。
+
+server **不提供登录工具**：二维码扫码必须由人完成，暴露成工具只会诱使
+AI agent 调用一个必然阻塞的接口。认证失效时工具会返回提示，让用户自行执行
+`miiotpcApi login`。
+
+`set_power` 有**真实世界副作用**，在 MCP 工具元数据中标记为 destructive，
+宿主可以对该工具单独设权限审批；其余查询工具标记为只读。
+
 ## 支持的 MIoT 能力
 
 以小米笔记本为例，常见 Spec（`urn:miot-spec-v2:device:laptop`）支持：
 
 | 属性 | 读写 | 说明 |
 |------|------|------|
-| `status` | 只读 | 工作状态枚举（1 唤醒中 / 2 关机 / 3 睡眠 / 4 关机中 / 6 进入睡眠中 / 8 运行中）|
+| `status` | 只读 | 工作状态枚举。**8=运行中，非 8 即非运行中**（1=正在唤醒 / 2=已关机 / 3=已睡眠 / 4=正在关机 / 6=正在进入睡眠）|
 | `temperature` | 只读 | CPU 温度（°C）|
 | `battery-level` | 只读 | 电池电量（%）|
 | `charging-state` | 只读 | 1 插电 / 2 电池供电 |

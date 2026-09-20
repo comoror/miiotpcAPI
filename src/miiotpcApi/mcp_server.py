@@ -598,7 +598,11 @@ def main() -> None:
     由 console script ``miiotpcApi-mcp`` 调用，注册方式：
 
         claude mcp add --transport stdio miiotpc \\
-            -- uvx --from "miiotpcApi[mcp]" miiotpcApi-mcp
+            -- uvx --from "miiotpcApi[mcp]@latest" miiotpcApi-mcp
+
+    **``@latest`` 不能省。** 实测裸 ``"miiotpcApi[mcp]"`` 会被 uv 解析到 0.1.0，
+    而旧版本没有 ``miiotpcApi-mcp`` 入口，server 起不来。等价的正确写法还有
+    ``"miiotpcApi[mcp]==0.2.0"`` 与 ``"miiotpcApi[mcp]>=0.2.0"``。
     """
     server.run(transport="stdio")
 
