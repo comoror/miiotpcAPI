@@ -77,6 +77,30 @@ tests/
 - 取值走 MIoT 原始属性名（`battery-level`）而非语义名（`battery_level`）
 - docstring 必须写全枚举、包含「非 8 即非运行中」和 EC 机制说明
 
+**v0.1.4 新增：离线设备跳过查询**
+
+真正离线（`isOnline=False`，断网/拔电）的设备不再发起属性查询——云端只会返回
+最后一次上报的过期值，查询没有意义。`TestOfflineSkipsQuery` 类锁定这一行为。
+
+关键在于断言**查询真的没有发生**，而不只是返回值变了：
+
+```python
+class FakeDevice:
+    def get(self, prop_name):
+        self.get_calls.append(prop_name)   # 记录每一次读取
+        ...
+```
+
+只检查 `result["temperature"] is None` 是不够的——实现可能只是把过期值改成
+`None` 但仍发了请求。所以断言 `pc._device.get_calls == []`。
+
+同一组里还有一条**对照测试** `test_online_powered_off_device_still_queries`：
+`isOnline=True` + `status=2`（关机但 EC 在线）时必须照常查询、返回实时值。
+这条防止「离线跳过」被过度泛化成「非运行就跳过」——正是本项目最容易搞错的地方。
+
+`pc.is_on()` 离线时返回 `None` 而非 `False`：「查不到」和「确认没开机」是两回事，
+返回值类型是 `Optional[bool]`。
+
 ### test_cli.py — 参数解析与输出
 
 参数解析：
@@ -113,6 +137,23 @@ tests/
 
 > 该守护用例曾暴露真实缺陷：CLI 提示语写成 `（1 唤醒中 / 2 已关机 ...）`，
 > 而 docstring 写成 `1=正在唤醒`，信息相同但记法不一致。现已统一为 `N=label`。
+
+`get` 子命令的离线守卫（v0.1.4）：
+
+CLI 有**两条独立的属性查询路径**，行为必须一致：
+
+| 路径 | 实现 |
+|------|------|
+| 顶层 `--get-prop` | `handle_pc()` → `PCDevice.get_prop()` |
+| `get --prop-name` 子命令 | `handle_get()` → `MiotDevice.get()` |
+
+`TestGetSubcommandOfflineGuard` 用桩替换 `MiotDevice`，断言 `get` 子命令在
+离线时不调用 `device.get()` 且不输出属性值，在线时正常查询。
+
+> **这组测试的由来**：v0.1.4 首次实现时只给 `PCDevice.get_prop()` 加了守卫，
+> `get` 子命令被漏掉，实测对离线设备仍返回 `temperature = 50`（云端过期值）。
+> 当时 92 个测试全绿——因为它们都在测 Python API，没有覆盖用户实际走的
+> CLI 子命令路径。教训：**要测用户真正调用的那条路径**，不是测改了的那个函数。
 
 ### test_api.py — 设备筛选逻辑
 

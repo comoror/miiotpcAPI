@@ -146,6 +146,11 @@ def print_devices(devices: list[dict], heading: str, note: str | None = None) ->
 
 def handle_get(api: miiotpcAPI, args: argparse.Namespace) -> None:
     device = MiotDevice(api, did=args.did, dev_name=args.dev_name)
+    # 设备真正离线时米家云端只会返回最后一次上报的过期值，查询没有意义。
+    # 注意与 PCDevice.get_prop() 的守卫保持一致——两条是不同的代码路径。
+    if not device.is_online:
+        print(f"{device.name} 已离线，属性 {args.prop_name} 不可查：云端仅有过期快照，已跳过查询")
+        return
     value = device.get(args.prop_name)
     print(f"{device.name} ({device.did}) 的 {args.prop_name} = {value}")
 
@@ -207,7 +212,10 @@ def handle_pc(api: miiotpcAPI, args: argparse.Namespace) -> None:
             print(f"{name:<20} siid={m.get('siid', '?'):<3} aiid={m.get('aiid', '?'):<3} {act.desc}")
     elif args.get_prop:
         value = pc.get_prop(args.get_prop)
-        print(f"{pc.name} 的 {args.get_prop} = {value}")
+        if value is None and not pc.is_online:
+            print(f"{pc.name} 已离线，属性 {args.get_prop} 不可查：云端仅有过期快照，已跳过查询")
+        else:
+            print(f"{pc.name} 的 {args.get_prop} = {value}")
     elif args.power == "on":
         pc.power_on()
         print(f"{pc.name} 已开机")
@@ -218,13 +226,24 @@ def handle_pc(api: miiotpcAPI, args: argparse.Namespace) -> None:
         pc.power_off()
         print(f"{pc.name} 已关机")
     elif args.temperature:
-        print(f"{pc.name} CPU 温度: {pc.get_temperature()} °C")
+        value = pc.get_temperature()
+        if value is None:
+            print(f"{pc.name} 已离线，CPU 温度不可查：云端仅有过期快照，已跳过查询")
+        else:
+            print(f"{pc.name} CPU 温度: {value} °C")
     elif args.battery:
-        print(f"{pc.name} 电池电量: {pc.get_battery_level()}%")
+        value = pc.get_battery_level()
+        if value is None:
+            print(f"{pc.name} 已离线，电池电量不可查：云端仅有过期快照，已跳过查询")
+        else:
+            print(f"{pc.name} 电池电量: {value}%")
     elif args.charging_state:
         state = pc.get_charging_state()
-        label = {1: "插电状态", 2: "电池供电"}.get(state, str(state))
-        print(f"{pc.name} 充电状态: {label} ({state})")
+        if state is None:
+            print(f"{pc.name} 已离线，充电状态不可查：云端仅有过期快照，已跳过查询")
+        else:
+            label = {1: "插电状态", 2: "电池供电"}.get(state, str(state))
+            print(f"{pc.name} 充电状态: {label} ({state})")
     else:
         raise RuntimeError("请指定操作，例如 --status 或 --power on/sleep/off")
 

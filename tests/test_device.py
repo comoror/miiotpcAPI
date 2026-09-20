@@ -31,7 +31,11 @@ STATUS_LABELS = {
 
 
 class FakeDevice:
-    """替代 MiotDevice，不触发任何网络请求"""
+    """替代 MiotDevice，不触发任何网络请求。
+
+    ``get_calls`` 记录每一次属性读取，用于断言「离线时根本没有发起查询」——
+    仅检查返回值是不够的，实现可能只是把过期值改成 None 但仍发了请求。
+    """
 
     def __init__(
         self,
@@ -49,8 +53,10 @@ class FakeDevice:
         self.is_online = is_online
         self._values = values or {}
         self._error = error
+        self.get_calls = []
 
     def get(self, prop_name):
+        self.get_calls.append(prop_name)
         if self._error is not None:
             raise self._error
         return self._values.get(prop_name)
@@ -72,7 +78,12 @@ def make_prop(name: str, rw: str = "r") -> DevProp:
 def make_pc(**kwargs) -> PCDevice:
     pc = object.__new__(PCDevice)
     pc._device = FakeDevice(**kwargs)
-    pc._capabilities = {"status": True, "temperature": True, "battery_level": True}
+    pc._capabilities = {
+        "status": True,
+        "temperature": True,
+        "battery_level": True,
+        "charging_state": True,
+    }
     pc._prop_map = {
         "status": make_prop("status"),
         "temperature": make_prop("temperature"),
@@ -122,8 +133,13 @@ class TestStatusSemantics:
         assert s["data_is_live"] is True
         assert "warning" not in s
 
-    def test_truly_offline_device_marks_data_stale(self):
-        """只有真正离线（断网/拔电）时数值才退化为过期快照"""
+    def test_offline_device_skips_query_entirely(self):
+        """**核心行为（v0.1.4）**：真正离线时根本不发起属性查询。
+
+        云端对离线设备只返回最后一次上报的过期值，查询没有意义。
+        断言两点：属性值为 None，且 FakeDevice.get 一次都没被调用——
+        只看返回值是不够的，实现可能只是把过期值改成 None 但仍发了请求。
+        """
         pc = make_pc(
             is_online=False,
             values={"status": 3, "temperature": 34, "battery-level": 51},
@@ -133,6 +149,30 @@ class TestStatusSemantics:
         assert s["data_is_live"] is False
         assert "warning" in s
         assert "离线" in s["warning"]
+        # 所有可读属性都是 None，而不是过期值
+        assert s["status"] is None
+        assert s["temperature"] is None
+        assert s["battery_level"] is None
+        assert s["charging_state"] is None
+        # 关键：桩没有被调用，证明真的跳过了查询
+        assert pc._device.get_calls == [], "离线设备不应发起任何属性查询"
+
+    def test_online_powered_off_device_still_queries(self):
+        """对照组：isOnline=True 但 status=2（关机）时**必须照常查询**。
+
+        主板 EC 有待机供电并持续上报，此时数值是实时的，不能跳过。
+        这条防止「离线跳过」被过度泛化成「非运行就跳过」。
+        """
+        pc = make_pc(
+            is_online=True,
+            values={"status": 2, "temperature": 33, "battery-level": 59},
+        )
+        s = pc.status
+        assert s["status"] == 2
+        assert s["temperature"] == 33
+        assert s["battery_level"] == 59
+        assert "warning" not in s
+        assert len(pc._device.get_calls) > 0, "在线设备必须实际查询"
 
     @pytest.mark.parametrize("status,label", sorted(STATUS_LABELS.items()))
     def test_status_values_round_trip(self, status, label):
@@ -147,6 +187,62 @@ class TestStatusSemantics:
         assert pc.is_on() is is_running
 
 
+class TestOfflineSkipsQuery:
+    """离线设备的所有查询路径都必须跳过网络请求（v0.1.4）"""
+
+    GETTERS = ["get_status", "get_temperature", "get_battery_level", "get_charging_state"]
+
+    @pytest.mark.parametrize("method", GETTERS)
+    def test_offline_getter_returns_none_without_querying(self, method):
+        pc = make_pc(is_online=False, values={"temperature": 34, "battery-level": 51})
+        assert getattr(pc, method)() is None
+        assert pc._device.get_calls == [], f"{method} 离线时不应发起查询"
+
+    @pytest.mark.parametrize("method", GETTERS)
+    def test_online_getter_queries_exactly_once(self, method):
+        values = {"status": 8, "temperature": 51, "battery-level": 100, "charging-state": 1}
+        pc = make_pc(is_online=True, values=values)
+        result = getattr(pc, method)()
+        assert result is not None
+        assert len(pc._device.get_calls) == 1
+
+    def test_is_on_returns_none_when_offline(self):
+        pc = make_pc(is_online=False, values={"status": 8})
+        assert pc.is_on() is None
+        assert pc._device.get_calls == []
+
+    @pytest.mark.parametrize("status,expected", [(8, True), (2, False), (3, False)])
+    def test_is_on_queries_when_online(self, status, expected):
+        pc = make_pc(is_online=True, values={"status": status})
+        assert pc.is_on() is expected
+        assert len(pc._device.get_calls) == 1
+
+    def test_get_prop_returns_none_when_offline(self):
+        pc = make_pc(is_online=False, values={"temperature": 34})
+        assert pc.get_prop("temperature") is None
+        assert pc._device.get_calls == []
+
+    def test_get_prop_passes_through_when_online(self):
+        pc = make_pc(is_online=True, values={"temperature": 44})
+        assert pc.get_prop("temperature") == 44
+        assert pc._device.get_calls == ["temperature"]
+
+    def test_offline_device_capabilities_still_reported(self):
+        """跳过查询不影响能力探测——capabilities 不依赖在线状态"""
+        pc = make_pc(is_online=False)
+        s = pc.status
+        assert s["capabilities"]["temperature"] is True
+
+    def test_warning_distinguishes_offline_from_powered_off(self):
+        """warning 文案必须点明「关机但在线」不在此列，避免误导
+
+        这是本项目最容易搞错的一点：关机不等于离线，关机时 EC 仍在上报。
+        """
+        s = make_pc(is_online=False).status
+        assert "isOnline" in s["warning"]
+        assert "EC" in s["warning"]
+
+
 class TestStatusShape:
     def test_contains_identity_and_capabilities(self):
         pc = make_pc(is_online=True, values={"status": 8})
@@ -154,7 +250,12 @@ class TestStatusShape:
         assert s["name"] == "测试笔记本"
         assert s["model"] == "xiaomi.laptop.test"
         assert s["did"] == "123456"
-        assert s["capabilities"] == {"status": True, "temperature": True, "battery_level": True}
+        assert s["capabilities"] == {
+            "status": True,
+            "temperature": True,
+            "battery_level": True,
+            "charging_state": True,
+        }
 
     def test_capabilities_are_copied_not_aliased(self):
         """返回的 capabilities 被改动不应污染设备内部状态"""

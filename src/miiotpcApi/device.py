@@ -472,7 +472,15 @@ class PCDevice():
 
     @property
     def is_online(self) -> bool:
-        """设备是否在线（米家上报）。离线时 status 中的数值是过期快照。"""
+        """设备是否在线（米家上报）。
+
+        为 False 表示设备真正不可达（断网/拔电/超出通信范围），此时所有属性
+        查询都会被跳过并返回 None——云端只剩最后一次上报的过期值。
+
+        为 True 仅代表设备联网可达，**不代表 OS 在运行**：关机/睡眠时主板 EC
+        仍有待机供电、联网模块保持在线，因此 is_online 仍为 True。判断是否
+        开机请看 ``status`` 字段（8=运行中）。
+        """
         return bool(getattr(self._device, "is_online", True))
 
     @property
@@ -488,10 +496,16 @@ class PCDevice():
           联网模块保持在线，因此 ``isOnline`` 为 True 并不代表 OS 在运行。
         - ``data_is_live``：属性值是否为实时上报。温度与电量由主板 EC 上报，
           OS 关机后 EC 仍在工作，所以**关机设备的这两个值依然是实时的**；
-          只有设备真正离线（``isOnline`` 为 False）时才退化为过期快照。
+          只有设备真正离线（``isOnline`` 为 False）时才不可信。
 
-        仅当 ``data_is_live`` 为 False 时附带 ``warning``，说明数值已过期——
-        调用方不应把这些值当作实时数据呈现。
+        **设备真正离线时不会发起属性查询**（v0.1.4）：此时米家云端只会返回
+        最后一次上报的过期值，查询没有意义，因此直接跳过网络请求，所有属性
+        字段填 ``None``，并附 ``warning`` 说明原因。
+
+        注意区分两种情形：
+        - ``isOnline`` 为 True 但 ``status`` 非 8（关机/睡眠）→ EC 仍在上报，
+          **照常查询**，数值实时。
+        - ``isOnline`` 为 False → 设备真正不可达，**跳过查询**。
         """
         is_online = bool(getattr(self._device, "is_online", True))
         result = {
@@ -502,11 +516,21 @@ class PCDevice():
             "data_is_live": is_online,
             "capabilities": self.capabilities,
         }
+
         if not is_online:
+            # 设备真正离线：云端只剩过期快照，查询是无意义的网络往返，
+            # 直接跳过并把属性标记为 None，调用方不会误把旧值当实时值。
             result["warning"] = (
-                "设备离线，以下属性值是云端缓存的最后一次上报数据，不是实时值，"
-                "可能与设备当前实际状态不符。"
+                "设备离线（isOnline=false），云端只会返回最后一次上报的过期值，"
+                "无查询意义，已跳过属性读取，各属性字段为 None。"
+                "注意：关机/睡眠但 isOnline 为 true 的设备不在此列——"
+                "主板 EC 仍有待机供电并持续上报，其数值是实时的。"
             )
+            for semantic_name, prop in self._prop_map.items():
+                if "r" in prop.rw:
+                    result[semantic_name] = None
+            return result
+
         for semantic_name, prop in self._prop_map.items():
             if "r" in prop.rw:
                 try:
@@ -578,9 +602,29 @@ class PCDevice():
             return True
         self._check_capability("power_off", "关机")
 
-    def is_on(self) -> bool:
-        """查询电源状态"""
+    def _require_online(self, label: str) -> bool:
+        """查询前的在线性检查。设备真正离线时返回 False，调用方应跳过查询。
+
+        离线设备的属性值只是米家云端缓存的最后一次上报，查询既慢又无意义，
+        还容易被误当作实时值。
+
+        注意范围：只有 ``is_online`` 为 False 才算离线。**关机/睡眠但联网的
+        设备不在此列**——主板 EC 仍有待机供电并持续上报温度/电量，数值实时。
+        """
+        if self.is_online:
+            return True
+        logger.warning(f"{self.name} 已离线，跳过{label}查询：云端只会返回过期快照")
+        return False
+
+    def is_on(self) -> Optional[bool]:
+        """判断是否运行中（status == 8）。
+
+        设备真正离线时返回 None——离线设备无从得知当前运行状态，
+        云端的 status 也只剩最后一次上报值。
+        """
         self._check_capability("status", "状态查询")
+        if not self._require_online("状态"):
+            return None
         status = self._device.get(self._prop_map["status"].name)
         # Laptop Spec: 8=Running; 1/2/3/4/6 are transitional or off states.
         return status == 8
@@ -593,28 +637,38 @@ class PCDevice():
             return True
         self._check_capability("sleep", "睡眠")
 
-    def get_status(self):
-        """获取笔记本工作状态枚举值。"""
+    def get_status(self) -> Optional[int]:
+        """获取笔记本工作状态枚举值。设备真正离线时返回 None。"""
         self._check_capability("status", "状态查询")
+        if not self._require_online("状态"):
+            return None
         return self._device.get(self._prop_map["status"].name)
 
-    def get_temperature(self):
-        """获取 CPU 温度。"""
+    def get_temperature(self) -> Optional[int]:
+        """获取 CPU 温度。设备真正离线时返回 None。"""
         self._check_capability("temperature", "CPU 温度查询")
+        if not self._require_online("CPU 温度"):
+            return None
         return self._device.get(self._prop_map["temperature"].name)
 
-    def get_battery_level(self):
-        """获取电池电量百分比。"""
+    def get_battery_level(self) -> Optional[int]:
+        """获取电池电量百分比。设备真正离线时返回 None。"""
         self._check_capability("battery_level", "电池电量查询")
+        if not self._require_online("电池电量"):
+            return None
         return self._device.get(self._prop_map["battery_level"].name)
 
-    def get_charging_state(self):
-        """获取充电状态枚举值（1=插电，2=电池供电）。"""
+    def get_charging_state(self) -> Optional[int]:
+        """获取充电状态枚举值（1=插电，2=电池供电）。设备真正离线时返回 None。"""
         self._check_capability("charging_state", "充电状态查询")
+        if not self._require_online("充电状态"):
+            return None
         return self._device.get(self._prop_map["charging_state"].name)
 
     def get_prop(self, name: str):
-        """获取任意属性（透传）"""
+        """获取任意属性（透传）。设备真正离线时返回 None，不发起查询。"""
+        if not self._require_online(f"属性 {name}"):
+            return None
         return self._device.get(name)
 
     def set_prop(self, name: str, value):

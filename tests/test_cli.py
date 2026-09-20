@@ -216,6 +216,52 @@ class TestForceUtf8Stdio:
         assert calls == [1], "main() 入口未调用 force_utf8_stdio()"
 
 
+# ------------------------------------------------- get 子命令的离线守卫
+
+
+class _FakeMiotDevice:
+    """替代 MiotDevice，记录属性读取次数"""
+
+    def __init__(self, *, is_online=True, value=50, name="测试设备", did="123"):
+        self.is_online = is_online
+        self.name = name
+        self.did = did
+        self._value = value
+        self.get_calls = []
+
+    def get(self, prop_name):
+        self.get_calls.append(prop_name)
+        return self._value
+
+
+class TestGetSubcommandOfflineGuard:
+    """`get` 子命令走 handle_get → MiotDevice，与 PCDevice.get_prop 是两条路径。
+
+    回归防护：v0.1.4 首次实现时只给 PCDevice.get_prop() 加了守卫，
+    `get` 子命令对离线设备仍返回云端过期值（实测返回 temperature = 50）。
+    这组测试锁定两条路径行为一致。
+    """
+
+    def _run(self, monkeypatch, capsys, *, is_online):
+        fake = _FakeMiotDevice(is_online=is_online, value=50)
+        monkeypatch.setattr(cli, "MiotDevice", lambda *a, **kw: fake)
+        args = parse_args(["get", "--did", "123", "--prop-name", "temperature"])
+        cli.handle_get(None, args)
+        return capsys.readouterr().out, fake
+
+    def test_offline_get_subcommand_skips_query(self, monkeypatch, capsys):
+        out, fake = self._run(monkeypatch, capsys, is_online=False)
+        assert "已离线" in out
+        assert "已跳过查询" in out
+        assert fake.get_calls == [], "离线设备不应发起属性查询"
+        assert "temperature = " not in out, "不应输出任何属性值"
+
+    def test_online_get_subcommand_queries_normally(self, monkeypatch, capsys):
+        out, fake = self._run(monkeypatch, capsys, is_online=True)
+        assert "temperature = 50" in out
+        assert fake.get_calls == ["temperature"]
+
+
 # ------------------------------------------------------------ 一致性守护
 
 
