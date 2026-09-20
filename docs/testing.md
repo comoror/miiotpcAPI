@@ -6,11 +6,18 @@
 
 ```toml
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=7.0",
+    "mcp>=2",      # test_mcp_server.py 需要；CLI 用户不会被强制安装
+]
 ```
 
 > 早期草稿曾写「使用 Python 内置 unittest，不引入额外测试依赖」，但代码示例与
 > 实际实现均为 pytest。本文档已更正为与实现一致。
+
+`mcp` 只出现在 `dev` 与 `mcp` 两个 extra 里，**不在主依赖中**：只用 CLI 的用户
+不需要 MCP SDK。`__init__.py` 不得导入 `mcp_server`，这条由
+`TestConsistency.test_package_init_does_not_import_mcp_server` 守护。
 
 ## 运行测试
 
@@ -19,7 +26,7 @@ dev = ["pytest>=7.0"]
 uv run --extra dev pytest tests/ -v
 
 # 单个文件
-uv run --extra dev pytest tests/test_cli.py -v
+uv run --extra dev pytest tests/test_mcp_server.py -v
 
 # 指定测试类
 uv run --extra dev pytest tests/test_device.py::TestStatusSemantics -v
@@ -42,13 +49,14 @@ pytest 是可选依赖，声明在 `dev` extra 中。**全新环境（刚 clone�
 
 ```
 tests/
-├── test_api.py      # find_pc_devices 关键词筛选逻辑
-├── test_device.py   # PCDevice.status 语义（核心回归防护）
-└── test_cli.py      # 参数解析、设备列表输出、UTF-8 重配置、一致性守护
+├── test_api.py         # find_pc_devices 关键词筛选逻辑          17 个
+├── test_device.py      # PCDevice.status 语义（核心回归防护）    40 个
+├── test_cli.py         # 参数解析、设备列表输出、UTF-8、一致性   37 个
+└── test_mcp_server.py  # MCP server 渲染层与工具层               85 个
 ```
 
-所有用例**不联网**：`miiotpcAPI` 与 `PCDevice` 均通过 `object.__new__` 构造，
-注入桩对象替代真实设备与网络请求。
+合计 **179 个用例**，全部**不联网**。API 层一律通过 `object.__new__` 构造并注入
+桩方法，替代真实设备与网络请求。
 
 ## 各文件覆盖范围
 
@@ -155,15 +163,130 @@ CLI 有**两条独立的属性查询路径**，行为必须一致：
 > 当时 92 个测试全绿——因为它们都在测 Python API，没有覆盖用户实际走的
 > CLI 子命令路径。教训：**要测用户真正调用的那条路径**，不是测改了的那个函数。
 
+### test_mcp_server.py — MCP server
+
+分两层，各测各的职责：
+
+| 层 | 内容 | 测什么 |
+|----|------|--------|
+| **渲染函数层** | `render_device_list` / `render_power_status` / `render_full_status` / `render_power_action` / `render_device_spec` | 领域解读逻辑：枚举如何变成中文、离线如何处理、EC 机制如何说明 |
+| **工具层** | server 上注册的 `@tool` 函数 | 异常如何翻译成提示、工具元数据（名称/annotations/docstring） |
+
+**渲染层是本模块存在的理由**，也是回归防护的重点：MCP 工具的价值在于
+**返回已解读的文本**，而不是裸枚举。所以测试主要断言输出文案，而不是数据结构。
+
+桩的构造方式：`FakeAPI` 用 `object.__new__(miiotpcAPI)` 保留真实的
+`find_pc_devices()`（纯逻辑，值得测），只替换三个会触网的方法——
+`get_devices_list`、`get_devices_prop`、`run_action`。设备型号一律含
+`.laptop.`，这样 `get_device_info()` 走内置 Spec，不访问 `home.miot-spec.com`。
+
+`FakeAPI.queried_props` 记录每次查询命中的语义属性名，用于断言**查了什么**：
+
+```python
+def test_only_queries_status_property(self):
+    """get_power_status 是电源快速路径，只查 status，不碰温度/电量"""
+    fake = FakeAPI([RUNNING], {"1001": {"status": 8, "temperature": 55}})
+    render_power_status(fake.api)
+    assert fake.queried_props == ["status"]
+```
+
+这条用例锁定了 `get_power_status` 与 `get_full_status` 的**设计差异**：
+前者回答「开了吗」只查一个属性，后者才查全量。若将来有人图省事让两者都调
+`pc.status`，这条会失败。
+
+**关键回归防护：EC 语义在 MCP 输出里同样成立**
+
+```python
+def test_sleeping_but_online_still_reports_live_temperature(self):
+    values = {"1002": {"status": 3, "temperature": 41, "battery-level": 41}}
+    text = render_full_status(FakeAPI([SLEEPING], values).api)
+    assert "41 °C" in text   # 睡眠设备的温度是实时值，必须报告
+    assert "EC" in text
+    assert "不代表运行中的工况" in text
+```
+
+与 `test_device.py` 里的对照测试是同一条规则在不同层面的表达：一个锁数据，
+一个锁文案。
+
+**离线设备：输出里不得出现任何数值**
+
+```python
+def test_offline_device_tool_result_has_no_numbers(self):
+    fake = FakeAPI([OFFLINE], {"1003": {"status": 2, "temperature": 34, ...}})
+    text = tool_text("get_full_status", {})
+    assert "无数据（未查询）" in text
+    assert "34" not in text and "51" not in text
+```
+
+注意断言的是**数值本身不出现**，不只是「标注了离线」。因为调用方（AI agent）
+完全可能忽略标注、直接引用看到的数字。
+
+**结构性安全：不暴露 login 工具**
+
+```python
+def test_no_login_tool_exists(self):
+    names = {t.name for t in list_tools()}
+    assert "login" not in names
+    assert not any("login" in n.lower() or "qr" in n.lower() for n in names)
+```
+
+这比在文档里写「绝对不要调用 login」可靠：文档是祈使句，工具列表里没有的
+东西根本调不了。
+
+**元数据与描述即契约**
+
+- `set_power` 必须 `destructive_hint=True`、`read_only_hint=False`
+- 其余工具必须 `read_only_hint=True`
+- `server.instructions` 必须包含「非 8 即非运行中」「不是开关机判据」「EC」
+  「不提供登录工具」等关键规则
+- 每个工具的 docstring 必须包含其对应的判读规则
+
+这些规则会被注入模型上下文，所以**写错等于行为错误**，测试把它们钉住。
+
+**schema 校验发生在工具函数之前**
+
+```python
+def test_set_power_invalid_action_rejected_by_schema(self):
+    with pytest.raises(ToolError) as exc:
+        call_tool("set_power", {"did": "1001", "action": "toggle"})
+    assert "'on', 'sleep' or 'off'" in str(exc.value)
+```
+
+MCP SDK 用类型注解生成输入 schema 并在调用前校验，所以 `toggle` 这类非法取值
+根本到不了业务代码。这比在工具里 try/except 更强——模型在协议层就无法发出
+非法调用。渲染函数层仍保留校验（`test_render_layer_still_validates_action_for
+_direct_callers`），因为 Python 直接调用时不经过 schema。
+
+**枚举标签以内置 Spec 为唯一权威来源**
+
+```python
+def test_status_labels_match_builtin_laptop_spec(self):
+    status_prop = next(p for p in LAPTOP_SPEC_PROPERTIES if p["name"] == "status")
+    spec_labels = {i["value"]: i["desc_zh_cn"] for i in status_prop["value-list"]}
+    assert STATUS_LABELS == spec_labels
+```
+
+`LAPTOP_SPEC_PROPERTIES` 来自真机规格，是唯一权威。MCP、CLI、文档三处都要
+对齐它，而不是互相抄。
+
+> 充电枚举是例外：Spec 写「插电状态/离电状态」，而给用户看的输出统一用
+> 「插电/电池供电」。措辞可以不同，**取值集合必须一致**，见
+> `test_charging_labels_cover_all_spec_values`。
+
+> **一个踩过的坑**：判断「包没有导入 mcp_server」时不能用
+> `hasattr(miiotpcApi, "mcp_server")`——测试模块自己导入了该子模块，Python 会
+> 因此在包对象上设置属性，断言必然失败。要看的是 `__init__.py` 的**源码**。
+
 ### test_api.py — 设备筛选逻辑
 
-`find_pc_devices()` 是 `--list-pc` 能否找到设备的**唯一**依据，覆盖：
+`find_pc_devices()` 是 `--list-pc` 与 MCP `list_devices` 能否找到设备的
+**唯一**依据，覆盖：
 
 - 默认关键词 `pc`/`电脑`/`笔记本`/`laptop`/`desktop`/`notebook` 每一个都生效
 - 匹配大小写不敏感（`MY LAPTOP` 能命中）
 - 名称与 model 任一命中即可
-- **无关键词命中时返回空列表** —— skill 文档记载的已知坑：
-  设备名不含 PC 关键词时 `--list-pc` 为空，应改用 `--list-devices`
+- **无关键词命中时返回空列表** —— 已知坑：设备名不含 PC 关键词时查询为空，
+  MCP `list_devices` 的返回文案会说明这一点
 - 自定义 `keyword` 是**追加**到默认集合，不覆盖
 - 自定义关键词自动转小写
 - `name`/`model` 字段缺失时不抛异常
@@ -174,16 +297,31 @@ CLI 有**两条独立的属性查询路径**，行为必须一致：
 1. **不联网**：所有对外部 API 的调用用桩对象替代，不发送真实请求
 2. **不测试加密逻辑**：`miutils.py` 直接复用自 mijiaAPI，不重复测试
 3. **不测试认证流程**：`login()` 需要真实扫码，属人工流程，禁止在测试中触发
-4. **锁定语义而非实现细节**：`data_is_live` 这类语义一旦变更必须是显式决策，
-   测试的作用是让这种变更无法悄悄发生
+   —— MCP server 侧同理，`AuthUnavailableError` 用桩触发，不构造真实缺失的认证
+4. **锁定语义而非实现细节**：`data_is_live`、EC 上报这类语义一旦变更必须是
+   显式决策，测试的作用是让这种变更无法悄悄发生
 5. **守护文档与代码的一致性**：枚举值、版本号这类分散在多处的信息，
    用测试强制对齐
+6. **断言「没发生查询」而不只是「返回了什么」**：离线跳过、电源快速路径
+   都靠记录调用来验证，只看返回值会被「发了请求但返回 None」骗过
+7. **给用户看的文本也是契约**：MCP 输出会被 agent 直接引用，文案错误等同于
+   行为错误，所以关键措辞有测试钉住
 
 ## 已知局限
 
 - **`tests/` 不覆盖真实设备交互**：桩对象无法发现米家云端行为变化
   （例如某个 model 的 Spec 变更）。这类问题只能靠实机调用发现。
+- **MCP 的 stdio 子进程路径不在 pytest 覆盖范围内**：测试通过
+  `server.call_tool()` 进程内调用，**没有**起真实子进程走 JSON-RPC。
+  该路径已用一次性脚本实机验证（真实设备 + SDK 的 `Client`/`StdioServerParameters`），
+  但脚本未纳入仓库。若 server 无法启动、或日志写到 stdout 污染协议流，
+  pytest 发现不了。
 - **PowerShell 形态的 CLI 调用未纳入测试**：pytest 只跑 Python 进程内逻辑，
   文档中的 PowerShell 管道示例需人工验证。
 - **`get`/`set`/`action` 的网络错误路径未覆盖**：这些路径需要 mock
   `requests` 会话，当前测试集未包含。
+
+> **一条与 MCP 相关的隐患，测试无法覆盖**：`logger.py` 使用
+> `logging.StreamHandler()`（无参，默认写 **stderr**），所以日志不会污染
+> MCP 的 stdout JSON-RPC 流。若将来有人改成显式传 `sys.stdout`，MCP server
+> 会立刻失效，而 pytest 全绿。改动 `logger.py` 时必须手工验证 stdio 路径。

@@ -48,10 +48,15 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "mcp>=2",
+]
+mcp = [
+    "mcp>=2",
 ]
 
 [project.scripts]
 miiotpcApi = "miiotpcApi.__main__:cli"
+miiotpcApi-mcp = "miiotpcApi.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/comoror/miiotpcAPI"
