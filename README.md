@@ -29,6 +29,7 @@
 - 查看任意设备型号的 MIoT Spec（无需登录）
 - 提供 **Python API、CLI、MCP server** 三种使用方式
 - MCP server 返回**已解读的中文结果**，AI agent 无需自己翻译 MIoT 枚举
+- 附带 **Claude Code skill**（[skills.sh](https://skills.sh) 生态收录），agent 可直接安装复用
 
 ## 安装
 
@@ -131,6 +132,23 @@ AI agent 调用一个必然阻塞的接口。认证失效时工具会返回提�
 
 `set_power` 有**真实世界副作用**，在 MCP 工具元数据中标记为 destructive，
 宿主可以对该工具单独设权限审批；其余查询工具标记为只读。
+
+### Skill（供 Claude Code 等 agent 使用）
+
+仓库自带 `miiotpc-api` skill（位于 `skills/miiotpc-api/`），内容对应 PyPI 0.2.0：
+**MCP 工具优先、CLI 兜底**，含 `status`/`isOnline`/`data_is_live` 三维判读规则
+与主板 EC 上报机制说明。经 [skills.sh](https://skills.sh) 生态分发（2026-09-21 实测通过）：
+
+```bash
+npx skills add comoror/miiotpcAPI@miiotpc-api
+```
+
+CLI 会自动检测本机已安装的 agent（Claude Code、Cursor、Codex 等 20+ 种）并安装到
+对应技能目录。手动安装也可以：把 `skills/miiotpc-api/` 目录复制到
+`~/.claude/skills/`（Claude Code）即可。
+
+> **注意带 `@miiotpc-api`**：不带时 CLI 会尝试安装仓库内全部技能（本仓库只有一个，
+> 结果相同，但显式指定意图更清晰）。
 
 ## 支持的 MIoT 能力
 
